@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres
+    container_name: plane-sailing-db
+    environment:
+      POSTGRES_USER: ${PLANE_SAILING_DB_USER}
+      POSTGRES_PASSWORD: ${PLANE_SAILING_DB_PASSWORD}
+      POSTGRES_DB: ${PLANE_SAILING_DB_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # - migrations: /flyway/sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PLANE_SAILING_DB_USER} -d ${PLANE_SAILING_DB_NAME}"]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - plane-sailing-net
+
+volumes:
+  pgdata:
+
+networks:
+  plane-sailing-net:
+    driver: bridge
