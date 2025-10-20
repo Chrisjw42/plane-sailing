@@ -8,7 +8,8 @@ services:
       POSTGRES_DB: ${PLANE_SAILING_DB_NAME}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # - migrations: /flyway/sql:ro
+      # Mount the migrations directory to the location where Flyway expects to find SQL migration files
+      - ./migrations:/flyway/sql:ro
     ports:
       - "5432:5432"
     healthcheck:
@@ -19,8 +20,29 @@ services:
     networks:
       - plane-sailing-net
 
+  flyway:
+    image: flyway/flyway
+    container_name: plane-sailing-flyway
+    depends_on:
+      - db
+    environment:
+      # NOTE that flyway references 'db' by its service name, leveraging the Docker Compose internal DNS
+      FLYWAY_URL: jdbc:postgresql://db:5432/${PLANE_SAILING_DB_NAME}
+      FLYWAY_USER: ${PLANE_SAILING_DB_USER}
+      FLYWAY_PASSWORD: ${PLANE_SAILING_DB_PASSWORD}
+    ports:
+    - "5432:5432"
+    command: -locations=filesystem:/flyway/sql migrate
+    volumes:
+      - ./migrations:/flyway/sql:ro
+    networks:
+      - plane-sailing-net
+    # Ensure Flyway runs only once and does not restart
+    restart: "no"
+
 volumes:
   pgdata:
+  # migrations:
 
 networks:
   plane-sailing-net:
