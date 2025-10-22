@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres
+    image: postgres:18
     container_name: plane-sailing-db
     environment:
       POSTGRES_USER: ${PLANE_SAILING_DB_USER}
@@ -26,12 +26,10 @@ services:
     depends_on:
       - db
     environment:
-      # NOTE that flyway references 'db' by its service name, leveraging the Docker Compose internal DNS
+      # NOTE that flyway references the 'db' service by its name, leveraging the Docker Compose internal DNS
       FLYWAY_URL: jdbc:postgresql://db:5432/${PLANE_SAILING_DB_NAME}
       FLYWAY_USER: ${PLANE_SAILING_DB_USER}
       FLYWAY_PASSWORD: ${PLANE_SAILING_DB_PASSWORD}
-    ports:
-    - "5432:5432"
     command: -locations=filesystem:/flyway/sql migrate
     volumes:
       - ./migrations:/flyway/sql:ro
