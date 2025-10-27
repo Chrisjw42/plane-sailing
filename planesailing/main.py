@@ -328,5 +328,6 @@ def main():
 
     return adsb
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()

@@ -1,11 +1,10 @@
 [project]
-name = "plane_sailing"
+name = "planesailing"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "cosmosdr",
     "pandas>=2.3.2",
     "pyrtlsdr>=0.3.0",
     "rs1090>=0.4.14",
@@ -14,6 +13,8 @@ dependencies = [
     "setuptools>=80.9.0",
     "structlog>=25.4.0",
 ]
+[tool.setuptools]
+py-modules = ["planesailing"]
 
 [dependency-groups]
 dev = [
@@ -29,4 +30,4 @@ ui = [
 
 [tool.uv.sources]
 # TODO publish cosmosdr to pypi
-cosmosdr = { path = "../cosmosdr", editable = true }
+cosmosdr = { path = "/home/chris/repo/cosmosdr", editable = true }
