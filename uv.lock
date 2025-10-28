@@ -767,6 +767,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "pandas" },
+    { name = "plotly" },
     { name = "pyrtlsdr" },
     { name = "rs1090" },
     { name = "rtl-sdr" },
@@ -790,6 +791,7 @@ ui = [
 [package.metadata]
 requires-dist = [
     { name = "pandas", specifier = ">=2.3.2" },
+    { name = "plotly", specifier = ">=6.3.0" },
     { name = "pyrtlsdr", specifier = ">=0.3.0" },
     { name = "rs1090", specifier = ">=0.4.14" },
     { name = "rtl-sdr", specifier = ">=1.0.0" },
