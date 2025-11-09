@@ -1,5 +1,8 @@
 """Precursor module with aircraft processing logic, that will eventually be moved into a standalone package"""
 
+from cachetools import TTLCache
+from collections.abc import Iterable
+from dataclasses import dataclass
 import time
 from datetime import datetime
 from copy import copy
@@ -21,6 +24,57 @@ ADSB_FREQUENCY = 1090e6
 ADSB_BITS = 112
 # One microsecond timeslot for one bit, 'on' if signal is within the first half of this slot
 # ADSB_SLOT_LENGTH = 1 / 1e6
+
+
+@dataclass
+class ADSBPreParsedHit:
+    timestamp: float
+    hex_string: str
+    index: int
+
+
+class ADSBRecentMessagesCache:
+    def __init__(self, max_length=np.inf):
+        self.max_length = max_length
+        self.cache = TTLCache(maxsize=max_length, ttl=300)  # 5 minute TTL
+
+    def add_message(self, message: ADSBPreParsedHit):
+        self.cache[message.hex_string] = message
+
+    def add_messages(self, messages: Iterable[ADSBPreParsedHit]):
+        for message in messages:
+            self.add_message(message)
+
+    def get_messages(self):
+        return self.cache
+
+
+RecentMessagesCache = ADSBRecentMessagesCache()
+
+
+def decode_current_cached_messages(verbose=False):
+    """Decode all currently cached messages, returning a DataFrame of decoded messages."""
+    cached_messages = RecentMessagesCache.get_messages()
+    if verbose:
+        logger.info("Decoding %s cached messages", len(cached_messages))
+
+    timestamps = [msg.timestamp for msg in cached_messages.values()]
+    hexes = [msg.hex_string for msg in cached_messages.values()]
+
+    parsed_msgs = rs1090.decode(msg=hexes, timestamp=timestamps)
+
+    parsed_msgs_df = pd.DataFrame(parsed_msgs)
+
+    if verbose:
+        logger.info("Parsed ADSB messages: %s", len(parsed_msgs_df))
+        if "latitude" in parsed_msgs_df.columns:
+            parsed_msgs_with_position = parsed_msgs_df[
+                parsed_msgs_df["latitude"].notnull()
+            ]
+            logger.info(
+                "Messages with position: %s", parsed_msgs_with_position.shape[0]
+            )
+    return parsed_msgs_df
 
 
 def get_example_dataset(
@@ -224,6 +278,81 @@ def convert_adsb_binary_to_hex(adsb):
     return hex_string
 
 
+def _batch_generate_hexes(
+    n: int,
+    sleep_time,
+    sample_rate: float = 2.4e6,
+    target_sr: float = 12e6,
+    n_reads_to_try_to_parse=20,
+    verbose: bool = False,
+):
+    """ALTERNATIVE TO _batch_decode_adsb Inner loop of the main process. Intended to run repeatedly, indefinitely.
+
+    Args:
+        n: The number of reads to process in this batch.
+        verbose (bool, optional): _description_. Defaults to False.
+
+    Returns:
+        _type_: _description_
+    """
+    hits = 0
+
+    pre_parsed_msgs = []
+
+    t0 = datetime.now()
+    for i in range(n):
+        try:
+            # Sleep a bit to allow the signal streamer to fill the buffer, and to not hammer CPU
+            time.sleep(sleep_time)
+            signal = s_acq.streamer.get_current_signal()
+            # Pick the read with the highest peak, which is likely an ADSB pulse
+            indices_of_strongest_signal = s_acq.get_indices_of_highest_peaks(
+                signal, verbose=verbose, n=20
+            )
+            # Loop over the top N strongest signals
+            for i, index in enumerate(indices_of_strongest_signal):
+                iq = signal[index]
+
+                # Only do the expensive signal processing on the strongest read
+                iq_mag = preprocess_iq(
+                    iq, orig_sr=sample_rate, target_sr=target_sr, verbose=verbose
+                )
+                iq_mag_bin = convert_to_binary(iq_mag)
+                adsb = decode_to_adsb(iq_mag_bin, verbose=verbose)
+
+                if adsb is not None:
+                    # We have what looks like an ADSB message, try to decode it
+                    if verbose:
+                        logger.info("ADSB message identified, attempting to decode")
+                    hex_string = convert_adsb_binary_to_hex(adsb)
+                    hits += 1
+                    # multiple timestamped messages are required to decode true position
+                    hit = ADSBPreParsedHit(
+                        timestamp=datetime.now().timestamp(),
+                        hex_string=hex_string,
+                        index=index,
+                    )
+                    pre_parsed_msgs.append(
+                        hit
+                    )  # TODO don't return anything, just add to cache
+                    RecentMessagesCache.add_message(hit)
+
+        except Exception as e:
+            if verbose:
+                logger.warning("Error processing read, moving on to next read", error=e)
+            # Don't worry if one read fails, just move on to the next read
+            # We expect to receive chopped off signals and imperfect data
+
+    if verbose:
+        t1 = datetime.now()
+        delta_t = (t1 - t0).total_seconds()
+
+        logger.info("Hit rate: %s\t/\t%s", hits, n)
+        logger.info("Total processing time for %s reads: %s seconds", n, delta_t)
+        logger.info("Average time per read: %s seconds", delta_t / n)
+    return pre_parsed_msgs
+
+
 def _batch_decode_adsb(
     n: int,
     sleep_time,
@@ -250,10 +379,9 @@ def _batch_decode_adsb(
             # Sleep a bit to allow the signal streamer to fill the buffer, and to not hammer CPU
             time.sleep(sleep_time)
             signal = s_acq.streamer.get_current_signal()
-
             # Pick the read with the highest peak, which is likely an ADSB pulse
             indices_of_strongest_signal = s_acq.get_indices_of_highest_peaks(
-                signal, verbose=verbose, n=5
+                signal, verbose=verbose, n=20
             )
             # Loop over the top N strongest signals
             for i, index in enumerate(indices_of_strongest_signal):
