@@ -1,3 +1,3 @@
-from . import main
+from . import main, adsb_processing
 
-__all__ = ["main"]
+__all__ = ["main", "adsb_processing"]
