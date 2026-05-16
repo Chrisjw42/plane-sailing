@@ -29,7 +29,33 @@ DYLD_LIBRARY_PATH="$(brew --prefix librtlsdr)/lib" uv run python -m planesailing
 
 Linux doesn't need this — `apt`'s `librtlsdr` lands in a path `ld.so` already searches.
 
-### run the database
+## Running
+
+### Stream ADS-B from the SDR
+
+Plug in an RTL-SDR dongle, then:
+
+```
+uv run python -m planesailing.main
+```
+
+This calls `main_ADSBStreamer()`, which:
+1. Starts `ADSBStreamer` in a background thread — it tunes to 1090 MHz, reads IQ samples, and decodes ADS-B frames into the in-memory `RecentMessagesCache`
+2. Polls the cache every second for 10 seconds, logging the decoded message count
+3. Stops the SDR stream and returns a DataFrame of all decoded messages
+
+To adjust the run duration, call it directly:
+
+```python
+from planesailing.main import main_ADSBStreamer
+df = main_ADSBStreamer(n_seconds=60)
+print(df)
+```
+
+The cache has a 5-minute TTL, so messages accumulate across repeated calls within the same process.
+
+### Run the database
+NOTE: the main pipeline is not hooked up to the DB yet
 ```
 export PLANE_SAILING_DB_USER=<whatever you want>
 export PLANE_SAILING_DB_PASSWORD=<whatever you want>
