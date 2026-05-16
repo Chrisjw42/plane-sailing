@@ -9,6 +9,7 @@ dependencies = [
     "cosmosdr",
     "pandas>=2.3.2",
     "plotly>=6.3.0",
+    "psycopg[binary]>=3.2",
     "pyrtlsdr>=0.3.0",
     "rs1090>=0.4.14",
     "scipy>=1.16.2",

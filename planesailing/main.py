@@ -1,10 +1,62 @@
-"""Precursor module with aircraft processing logic, that will eventually be moved into a standalone package"""
+"""ADSB pipeline overview (this module owns the boxed layers below):
+
+    SDR @ 1090 MHz  ->  cosmosdr.SignalStreamer   [bg thread, upstream]
+                            rolling (64, 4096) IQ buffer
+                            |
+                            | get_current_signal()
+                            v
+    +-------------------------------------------------------------+
+    | ADSBStreamer.stream_and_decode_adsb     [own bg thread]     |
+    |   owns DBWriter + PipelineConfig                            |
+    |   loop: _batch_generate_hexes()  until self.enabled flips   |
+    +---------------------------+---------------------------------+
+                                |
+                                v
+    +-------------------------------------------------------------+
+    | _batch_generate_hexes                    [stage-1, per-peak]|
+    |   top-N peaks -> preprocess_iq                              |
+    |               -> convert_to_binary                          |
+    |               -> decode_to_adsb                             |
+    |               -> convert_adsb_binary_to_hex                 |
+    |   each hit -> RecentMessagesCache (5-min TTL)               |
+    |            -> newly_added list (this cycle only)            |
+    +-----+-----------------------------------------+-------------+
+          |                                         |
+          v                                         v
+    +----------------+     read     +-------------------------------+
+    | TTL cache (5m) | <----------- | _write_cycle  [stage-2 + DB]  |
+    | raw hexes only |              |  1. rs1090.decode(newly)      |
+    +----------------+              |     -> map hex -> icao24      |
+                                    |  2. rs1090.decode(full cache) |
+                                    |     -> CPR pairs resolve      |
+                                    |        lat/lon across cycles  |
+                                    |  3. filter to icao24s seen    |
+                                    |     this cycle                |
+                                    |  4. groupby icao24,           |
+                                    |     last-non-null per field   |
+                                    |     -> list[PlaneSnapshot]    |
+                                    |  5. DBWriter.write_cycle(...) |
+                                    |     (see db.py)               |
+                                    +-------------------------------+
+
+Batching levels (same data, different scales):
+    sample (4096) -> read -> acquisition (64 reads) -> peak (top-N)
+    -> hex batch (this cycle, ~5-15 hits)
+    -> decode batch (whole 5-min cache, for CPR pair resolution)
+    -> write batch (1 snapshot per icao24 seen this cycle, 1 txn)
+
+Two decode stages, because position fixes need an even+odd CPR pair from
+the same icao24 within ~10s and they rarely land in the same cycle:
+    stage 1 (cheap, per-peak):  IQ -> magnitude -> bits -> ADSB struct -> hex
+    stage 2 (rich, per cycle):  hex+ts -> semantic fields, incl. lat/lon
+                                via CPR pairing across the whole cache
+"""
 
 from cachetools import TTLCache
 from collections.abc import Iterable
 from dataclasses import dataclass
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Thread
 
 import numpy as np
@@ -19,6 +71,15 @@ from planesailing.adsb_processing import (
     convert_to_binary,
     decode_to_adsb,
     convert_adsb_binary_to_hex,
+)
+from planesailing.config import PipelineConfig
+from planesailing.db import DBWriter, PlaneSnapshot
+from planesailing.util import (
+    clean_str,
+    last_non_null,
+    merged_raw,
+    to_float,
+    to_int,
 )
 
 logger = structlog.get_logger()
@@ -85,55 +146,66 @@ class ADSBStreamer:
         self.enabled: bool = False
         # If thread is none, then no acquisition loop is running, and we can start one
         self.thread: Thread | None = None
+        self.config: PipelineConfig | None = None
+        self.db_writer: DBWriter | None = None
+        self.persist: bool = True
 
     def start_adsb_stream(
         self,
-        sample_rate: float = 2.4e6,
-        target_sr: float = 12e6,
-        n_reads_per_acquisition: int = 64,
-        n_reads_to_try_to_parse: int = 64,
-        n_samples_per_read: int = 4096,
-        sleep_length_s: float = 0.01,
-        sdr_gain: str = "auto",
-        n=1,  # retained for later experimentation, not useful atm
-        verbose=False,
+        config: PipelineConfig | None = None,
+        persist: bool = True,
+        verbose: bool = False,
+        # Loose kwargs preserved for callers that haven't moved to PipelineConfig yet.
+        sample_rate: float | None = None,
+        target_sr: float | None = None,
+        n_reads_per_acquisition: int | None = None,
+        n_reads_to_try_to_parse: int | None = None,
+        n_samples_per_read: int | None = None,
+        sleep_length_s: float | None = None,
+        sdr_gain: str | None = None,
+        n: int | None = None,
     ):
         """
         Tell the ADSBStreamer to begin streaming with a given set of parameters.
 
         Creates a thread to run the acquisition loop in the background.
         """
+        if config is None:
+            overrides = {
+                k: v
+                for k, v in {
+                    "sample_rate": sample_rate,
+                    "target_sr": target_sr,
+                    "n_reads_per_acquisition": n_reads_per_acquisition,
+                    "n_reads_to_try_to_parse": n_reads_to_try_to_parse,
+                    "n_samples_per_read": n_samples_per_read,
+                    "sleep_length_s": sleep_length_s,
+                    "sdr_gain": sdr_gain,
+                    "n": n,
+                }.items()
+                if v is not None
+            }
+            config = PipelineConfig(**overrides)
+
         if not self.can_start_acquisition():
             logger.warning("ADSBStreamer: Acquisition loop already running")
 
         self.enabled = True
+        self.config = config
+        self.persist = persist
 
         # Start acquisition loop in background thread
         thread = Thread(
             target=self.stream_and_decode_adsb,
-            args=(
-                sample_rate,
-                target_sr,
-                n_reads_per_acquisition,
-                n_reads_to_try_to_parse,
-                n_samples_per_read,
-                sleep_length_s,
-                sdr_gain,
-                n,
-                verbose,
-            ),
+            args=(verbose,),
             daemon=True,  # stops automatically if main thread exits
         )
         thread.start()
         logger.info(
             "ADSBStreamer: ADSB Streamer",
-            sample_rate=sample_rate,
-            target_sr=target_sr,
-            n_reads_per_acquisition=n_reads_per_acquisition,
-            n_samples_per_read=n_samples_per_read,
-            sleep_length_s=sleep_length_s,
-            sdr_gain=sdr_gain,
-            n=n,
+            config=config.as_dict(),
+            fingerprint=config.fingerprint(),
+            persist=persist,
             verbose=verbose,
         )
         self.thread = thread
@@ -153,39 +225,25 @@ class ADSBStreamer:
         self.thread = None
         logger.info("ADSBStreamer: Acquisition loop stopped")
 
-    def stream_and_decode_adsb(
-        self,
-        sample_rate: float = 2.4e6,
-        target_sr: float = 12e6,
-        n_reads_per_acquisition: int = 64,
-        n_reads_to_try_to_parse: int = 64,
-        n_samples_per_read: int = 4096,
-        sleep_length_s: float = 0.01,
-        sdr_gain: str = "auto",
-        n=1,  # retained for later experimentation, not useful atm
-        verbose=False,
-    ):
+    def stream_and_decode_adsb(self, verbose: bool = False):
         """Start the signal streamer, then repeatedly grab the current signal, process it, and try to decode any ADSB messages.
 
-        Default parameters for n, reads per acquisition, samples per read, n_reads_to_try_to_parse and sleep time are chosen to maximise the number of
-        parsed hexes retrieved in a given block of time
-
         - Set up the signal stream
-        - While true, repeatedly run the inner loop: _batch_decode_adsb()
+        - While true, repeatedly run the inner loop: _batch_generate_hexes()
             - N times, grab a batch of reads
                 - Select the read with the highest individual peak (likely to be an ADSB pulse)
                 - Decode the ADSB pulse if possible
-            - Now we have all the ADSB pulses, feed them into the decoder again to derive positional info
-            - Write them to the RecentMessagesCache, where they can be later processed and written to the DB
-
-        n: number of reads to attempt, no longer used, retained for later experimentation
-        n_reads_per_acquisition: number of reads to acquire in each acquisition loop iteration
-        n_samples_per_read: number of samples per read in each acquisition loop iteration
-        sleep_length_s: time to wait between reads, purely for managing compute load
-        sample_rate: sample rate to use for the SDR, needs to be adjusted in-line with target_sr, see process_iq()
-        target_sr: target sample rate to resample to for processing, see process_iq()
-        verbose: if True, log more information
+                - Push the raw hex into the RecentMessagesCache (5-min TTL)
+            - Decode the full cache (so CPR pairs resolve across cycles) and write
+              one snapshot row per aircraft seen this cycle into Postgres.
         """
+        cfg = self.config
+        if cfg is None:
+            cfg = PipelineConfig()
+            self.config = cfg
+
+        if self.persist:
+            self.db_writer = DBWriter(cfg)
 
         # Ensure any existing stream is stopped
         s_acq.streamer.stop_stream()
@@ -193,30 +251,33 @@ class ADSBStreamer:
         # Kick off a SignalStream - this runs in the background, continuously updating the current signal buffer
         s_acq.streamer.start_stream(
             center_freq=ADSB_FREQUENCY,
-            sample_rate=sample_rate,
-            n_reads_per_acquisition=n_reads_per_acquisition,
-            n_samples_per_read=n_samples_per_read,
-            sleep_length_s=sleep_length_s
+            sample_rate=cfg.sample_rate,
+            n_reads_per_acquisition=cfg.n_reads_per_acquisition,
+            n_samples_per_read=cfg.n_samples_per_read,
+            sleep_length_s=cfg.sleep_length_s
             / 2,  # Ensure the signal stream is updated more frequently than the reads happen
-            sdr_gain="auto",
+            sdr_gain=cfg.sdr_gain,
         )
         try:
             # Give the streamer a moment to start up
             time.sleep(3)
 
-            while self.enabled:  # TODO CWI finish plugging this in, figure out if we can avoid manually adding the messages to the cache
+            while self.enabled:
                 self._batch_generate_hexes(
-                    n=n,
-                    sleep_length_s=sleep_length_s,
-                    sample_rate=sample_rate,
-                    target_sr=target_sr,
-                    n_reads_to_try_to_parse=n_reads_to_try_to_parse,
+                    n=cfg.n,
+                    sleep_length_s=cfg.sleep_length_s,
+                    sample_rate=cfg.sample_rate,
+                    target_sr=cfg.target_sr,
+                    n_reads_to_try_to_parse=cfg.n_reads_to_try_to_parse,
                     verbose=verbose,
                 )
 
         finally:
             # Always ensure the stream is stopped on exit
             s_acq.streamer.stop_stream()
+            if self.db_writer is not None:
+                self.db_writer.close()
+                self.db_writer = None
 
     def _batch_generate_hexes(
         self,
@@ -239,9 +300,11 @@ class ADSBStreamer:
             verbose: If True, log more information.
 
         Returns:
-            None, the parsed messages are added to the RecentMessagesCache.
+            None, the parsed messages are added to the RecentMessagesCache, and
+            snapshot rows are written to Postgres for icao24s seen this cycle.
         """
         hits = 0
+        newly_added: list[ADSBPreParsedHit] = []
 
         t0 = datetime.now()
         for i in range(n):
@@ -277,6 +340,7 @@ class ADSBStreamer:
                             index=index,
                         )
                         RecentMessagesCache.add_message(hit)
+                        newly_added.append(hit)
 
             except Exception as e:
                 if verbose:
@@ -286,6 +350,12 @@ class ADSBStreamer:
                 # Don't worry if one read fails, just move on to the next read
                 # We expect to receive chopped off signals and imperfect data
 
+        if newly_added and self.db_writer is not None:
+            try:
+                self._write_cycle(newly_added, verbose=verbose)
+            except Exception as e:
+                logger.warning("snapshot write skipped due to error", error=str(e))
+
         if verbose:
             t1 = datetime.now()
             delta_t = (t1 - t0).total_seconds()
@@ -293,6 +363,66 @@ class ADSBStreamer:
             logger.info("Hit rate: %s\t/\t%s", hits, n)
             logger.info("Total processing time for %s reads: %s seconds", n, delta_t)
             logger.info("Average time per read: %s seconds", delta_t / n)
+
+    def _write_cycle(
+        self, newly_added: list[ADSBPreParsedHit], verbose: bool = False
+    ) -> None:
+        """Decode the full TTL cache, build one snapshot per icao24 seen this cycle, write."""
+        # Map newly-added hexes back to icao24, keep the latest hex per aircraft.
+        new_hexes = [h.hex_string for h in newly_added]
+        new_ts = [h.timestamp for h in newly_added]
+        try:
+            decoded_new = rs1090.decode(msg=new_hexes, timestamp=new_ts)
+        except Exception as e:
+            logger.warning("rs1090 decode of newly-added hexes failed", error=str(e))
+            return
+
+        icao24_latest: dict[str, tuple[float, str]] = {}
+        for hit, dec in zip(newly_added, decoded_new):
+            if not isinstance(dec, dict):
+                continue
+            icao = dec.get("icao24")
+            if not icao:
+                continue
+            prev = icao24_latest.get(icao)
+            if prev is None or hit.timestamp > prev[0]:
+                icao24_latest[icao] = (hit.timestamp, hit.hex_string)
+
+        if not icao24_latest:
+            return
+
+        # Decode the full cache so CPR pairs from earlier cycles can resolve lat/lon.
+        full_df = RecentMessagesCache.decode_current_cached_messages(verbose=verbose)
+        if full_df is None or full_df.empty or "icao24" not in full_df.columns:
+            return
+
+        df = full_df[full_df["icao24"].isin(icao24_latest.keys())]
+        if df.empty:
+            return
+
+        snapshots: list[PlaneSnapshot] = []
+        sort_col = "timestamp" if "timestamp" in df.columns else None
+        for icao24, group in df.groupby("icao24"):
+            if sort_col is not None:
+                group = group.sort_values(sort_col)
+            latest_ts, raw_hex = icao24_latest[icao24]
+            snapshots.append(
+                PlaneSnapshot(
+                    icao24=icao24,
+                    ts=datetime.fromtimestamp(latest_ts, tz=timezone.utc),
+                    raw_hex=raw_hex,
+                    raw=merged_raw(group),
+                    callsign=clean_str(last_non_null(group, "callsign")),
+                    altitude=to_int(last_non_null(group, "altitude")),
+                    lat=to_float(last_non_null(group, "latitude")),
+                    lon=to_float(last_non_null(group, "longitude")),
+                    velocity=to_float(last_non_null(group, "groundspeed")),
+                    heading=to_float(last_non_null(group, "heading")),
+                    squawk=clean_str(last_non_null(group, "squawk")),
+                )
+            )
+
+        self.db_writer.write_cycle(snapshots)
 
 
 ADSBStreamer = ADSBStreamer()
