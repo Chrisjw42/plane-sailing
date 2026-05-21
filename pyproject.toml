@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "cachetools>=6.2.1",
-    "cosmosdr",
+    "cosmosdr @ git+https://github.com/Chrisjw42/cosmosdr.git@0.1.0",
     "pandas>=2.3.2",
     "plotly>=6.3.0",
     "psycopg[binary]>=3.2",
@@ -30,10 +30,3 @@ dev = [
 ui = [
     "dash>=3.2.0",
 ]
-
-[tool.uv.sources]
-# TODO publish cosmosdr to pypi
-# Relative path assumes cosmosdr is checked out as a sibling of plane-sailing,
-# i.e. <root>/repo/cosmosdr and <root>/repo/plane-sailing. Holds on both the
-# home server (/home/chris/repo/...) and dev machines (/Users/.../repo/...).
-cosmosdr = { path = "../cosmosdr", editable = true }

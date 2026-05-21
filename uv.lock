@@ -225,7 +225,7 @@ wheels = [
 [[package]]
 name = "cosmosdr"
 version = "0.1.0"
-source = { editable = "../cosmosdr" }
+source = { git = "https://github.com/Chrisjw42/cosmosdr.git?rev=0.1.0#8d19d2add2b70c6b7404c46ae1ce32ad59c77c2b" }
 dependencies = [
     { name = "pandas" },
     { name = "pyrtlsdr" },
@@ -234,26 +234,6 @@ dependencies = [
     { name = "setuptools" },
     { name = "structlog" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "pandas", specifier = ">=2.3.2" },
-    { name = "pyrtlsdr", specifier = ">=0.3.0" },
-    { name = "rtl-sdr", specifier = ">=1.0.0" },
-    { name = "scipy", specifier = ">=1.16.2" },
-    { name = "setuptools", specifier = ">=80.9.0" },
-    { name = "structlog", specifier = ">=25.4.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "ipykernel", specifier = ">=6.30.1" },
-    { name = "nbformat", specifier = ">=5.10.4" },
-    { name = "pre-commit", specifier = ">=4.3.0" },
-    { name = "pytest", specifier = ">=8.4.2" },
-    { name = "ruff", specifier = ">=0.13.0" },
-]
-ui = [{ name = "dash", specifier = ">=3.2.0" }]
 
 [[package]]
 name = "dash"
@@ -835,7 +815,7 @@ ui = [
 [package.metadata]
 requires-dist = [
     { name = "cachetools", specifier = ">=6.2.1" },
-    { name = "cosmosdr", editable = "../cosmosdr" },
+    { name = "cosmosdr", git = "https://github.com/Chrisjw42/cosmosdr.git?rev=0.1.0" },
     { name = "pandas", specifier = ">=2.3.2" },
     { name = "plotly", specifier = ">=6.3.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
