@@ -1,0 +1,19 @@
+# Keep the build context small and reproducible. Context root is the
+# plane-sailing/ repo (see infra/docker-compose.yaml). pyproject.toml, uv.lock,
+# README.md and planesailing/ are NOT excluded — they're needed by the image.
+.git
+.gitignore
+.venv
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+.ruff_cache
+.pytest_cache
+.mypy_cache
+.vscode
+.claude*
+tests
+# Collector's own runtime output (bind-mounted at runtime; never baked in).
+infra/collector/logs
+# Existing DB dumps — large, not needed in the image.
+infra/db_backups

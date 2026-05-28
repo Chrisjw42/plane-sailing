@@ -38,6 +38,51 @@ services:
     # Ensure Flyway runs only once and does not restart
     restart: "no"
 
+  collector:
+    build:
+      # Context is the plane-sailing repo root so the image can COPY in the package.
+      context: ..
+      dockerfile: infra/collector/Dockerfile
+    container_name: plane-sailing-collector
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # DB connection — planesailing/db.py reads these at runtime. Host is the
+      # compose service name 'db', resolved via the internal network DNS.
+      PLANE_SAILING_DB_HOST: db
+      PLANE_SAILING_DB_PORT: "5432"
+      PLANE_SAILING_DB_NAME: ${PLANE_SAILING_DB_NAME}
+      PLANE_SAILING_DB_USER: ${PLANE_SAILING_DB_USER}
+      PLANE_SAILING_DB_PASSWORD: ${PLANE_SAILING_DB_PASSWORD}
+      # Restart if no reading lands within this many seconds (15 min).
+      COSMOS_STALENESS_SECONDS: "900"
+      # Pipeline tunables. Any left unset fall back to PipelineConfig defaults;
+      # set only the one(s) you're experimenting with. Uncomment as needed:
+      COSMOS_N: "1"
+      COSMOS_SDR_GAIN: "auto"
+      # COSMOS_SAMPLE_RATE: "2400000"
+      # COSMOS_TARGET_SR: "12000000"
+      # COSMOS_N_READS_PER_ACQUISITION: "64"
+      # COSMOS_N_READS_TO_TRY_TO_PARSE: "64"
+      # COSMOS_N_SAMPLES_PER_READ: "4096"
+      # COSMOS_SLEEP_LENGTH_S: "0.01"
+    volumes:
+      # RTL-SDR passthrough: mount the whole USB bus so device re-enumeration
+      # (reboot / replug) doesn't invalidate a hard-coded device path.
+      - /dev/bus/usb:/dev/bus/usb
+      # Health/event log, readable on the host for overnight inspection.
+      - ./collector/logs:/var/log/cosmos
+    device_cgroup_rules:
+      # Allow access to USB character devices (major 189) under the cgroup.
+      - 'c 189:* rmw'
+    group_add:
+      # plugdev GID on the host — grants the container user SDR access.
+      - "46"
+    restart: unless-stopped
+    networks:
+      - plane-sailing-net
+
 volumes:
   pgdata:
   # migrations:
