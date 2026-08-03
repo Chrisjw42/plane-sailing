@@ -54,6 +54,24 @@ print(df)
 
 The cache has a 5-minute TTL, so messages accumulate across repeated calls within the same process.
 
+### COSMOS_N sweep experiment
+
+`infra/experiment/cosmos_n_cycle.sh` runs the collector for 24h per value of
+`COSMOS_N` through the sequence `1,2,3,4,6,8,...,30`. A user crontab entry fires
+it daily at 00:00 local; each firing bumps `COSMOS_N` in `infra/.env` and
+rebuilds+recreates only the collector container (Postgres stays up). After
+n=30's day it stops the collector and writes `done` to
+`infra/experiment/state`.
+
+- Current position: `infra/experiment/state` (`start` = armed, first firing
+  applies n=1; a number = the n now running; `done` = finished)
+- Flip history: `infra/experiment/cycle.log`; stray cron/docker output: `cron.log`
+- Each day's rows are linked to their config via the `PipelineConfig`
+  fingerprint in `cosmos.pipeline_configs`, so analysis can group by n directly
+- Recovery: `cosmos_n_cycle.sh --apply-current` re-applies the state file's
+  value without advancing; `--dry-run` previews the next flip
+- To end the experiment early: `crontab -e` and remove the line
+
 ### Run the database
 NOTE: the main pipeline is not hooked up to the DB yet
 ```

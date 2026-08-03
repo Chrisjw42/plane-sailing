@@ -369,19 +369,19 @@ class ADSBStreamer:
     ) -> None:
         """Decode the full TTL cache, build one snapshot per icao24 seen this cycle, write."""
         # Map newly-added hexes back to icao24, keep the latest hex per aircraft.
-        new_hexes = [h.hex_string for h in newly_added]
-        new_ts = [h.timestamp for h in newly_added]
-        try:
-            decoded_new = rs1090.decode(msg=new_hexes, timestamp=new_ts)
-        except Exception as e:
-            logger.warning("rs1090 decode of newly-added hexes failed", error=str(e))
-            return
-
+        # rs1090.decode silently omits undecodable messages from its output, so
+        # a batch result cannot be zipped back against the input list — decode
+        # one message at a time to keep the hex<->icao24 pairing exact.
         icao24_latest: dict[str, tuple[float, str]] = {}
-        for hit, dec in zip(newly_added, decoded_new):
-            if not isinstance(dec, dict):
+        for hit in newly_added:
+            try:
+                dec = rs1090.decode(msg=[hit.hex_string], timestamp=[hit.timestamp])
+            except Exception as e:
+                logger.warning("rs1090 decode of newly-added hex failed", error=str(e))
                 continue
-            icao = dec.get("icao24")
+            if not dec or not isinstance(dec[0], dict):
+                continue
+            icao = dec[0].get("icao24")
             if not icao:
                 continue
             prev = icao24_latest.get(icao)
@@ -406,6 +406,15 @@ class ADSBStreamer:
             if sort_col is not None:
                 group = group.sort_values(sort_col)
             latest_ts, raw_hex = icao24_latest[icao24]
+            lat = to_float(last_non_null(group, "latitude"))
+            altitude = to_int(last_non_null(group, "altitude"))
+            # Only persist snapshots carrying a position or an altitude.
+            # Everything else is dominated by Mode S replies (DF20/21/16) whose
+            # icao24 is recovered from the address/parity overlay — one bit
+            # error silently invents a ghost aircraft, and without position or
+            # altitude the row can never be attributed or used.
+            if lat is None and altitude is None:
+                continue
             snapshots.append(
                 PlaneSnapshot(
                     icao24=icao24,
@@ -413,8 +422,8 @@ class ADSBStreamer:
                     raw_hex=raw_hex,
                     raw=merged_raw(group),
                     callsign=clean_str(last_non_null(group, "callsign")),
-                    altitude=to_int(last_non_null(group, "altitude")),
-                    lat=to_float(last_non_null(group, "latitude")),
+                    altitude=altitude,
+                    lat=lat,
                     lon=to_float(last_non_null(group, "longitude")),
                     velocity=to_float(last_non_null(group, "groundspeed")),
                     heading=to_float(last_non_null(group, "heading")),

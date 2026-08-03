@@ -208,3 +208,8 @@ __marimo__/
 .vscode/settings.json
 
 .claude*
+.claude/worktrees/*
+
+# COSMOS_N experiment runtime state (the script itself is committed)
+infra/experiment/state
+infra/experiment/.lock

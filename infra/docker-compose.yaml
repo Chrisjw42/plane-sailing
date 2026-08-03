@@ -17,6 +17,7 @@ services:
       interval: 10s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
     networks:
       - plane-sailing-net
 
@@ -59,7 +60,7 @@ services:
       COSMOS_STALENESS_SECONDS: "900"
       # Pipeline tunables. Any left unset fall back to PipelineConfig defaults;
       # set only the one(s) you're experimenting with. Uncomment as needed:
-      COSMOS_N: "1"
+      COSMOS_N: "${COSMOS_N:-1}"
       COSMOS_SDR_GAIN: "auto"
       # COSMOS_SAMPLE_RATE: "2400000"
       # COSMOS_TARGET_SR: "12000000"
