@@ -46,6 +46,41 @@ log() {
   [[ "$DRY_RUN" == 1 ]] || echo "$line" >> "$LOG_FILE"
 }
 
+# radioviz can borrow the SDR by stopping the collector (a "lease"). If we
+# recreated the collector mid-lease it would fail to open the device and
+# crash-loop, so ask radioviz to give the SDR back first and wait for it.
+# A lease file whose pid is dead is stale: radioviz's reaper cleans those up,
+# and we carry on. After the timeout we proceed regardless.
+RADIOVIZ_STATE_DIR="${RADIOVIZ_STATE_DIR:-$HOME/.local/state/radioviz}"
+RADIOVIZ_LEASE_FILE="$RADIOVIZ_STATE_DIR/sdr.lease"
+RADIOVIZ_RELEASE_REQUEST="$RADIOVIZ_STATE_DIR/sdr.release-request"
+RADIOVIZ_WAIT_S="${RADIOVIZ_WAIT_S:-120}"
+
+radioviz_lease_live() {
+  [[ -f "$RADIOVIZ_LEASE_FILE" ]] || return 1
+  local pid
+  pid="$(grep -o '"pid": *[0-9]*' "$RADIOVIZ_LEASE_FILE" | grep -o '[0-9]*$' || true)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+wait_for_radioviz_release() {
+  radioviz_lease_live || return 0
+  log "RADIOVIZ_LEASE active; requesting release (waiting up to ${RADIOVIZ_WAIT_S}s)"
+  [[ "$DRY_RUN" == 1 ]] && return 0
+  echo "{\"requested_by\": \"cosmos_n_cycle\", \"at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$RADIOVIZ_RELEASE_REQUEST"
+  local waited=0
+  while radioviz_lease_live && (( waited < RADIOVIZ_WAIT_S )); do
+    sleep 2
+    waited=$((waited + 2))
+  done
+  rm -f "$RADIOVIZ_RELEASE_REQUEST"
+  if radioviz_lease_live; then
+    log "RADIOVIZ_LEASE still held after ${RADIOVIZ_WAIT_S}s; proceeding anyway"
+  else
+    log "RADIOVIZ_LEASE released after ${waited}s"
+  fi
+}
+
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "another cycle run holds the lock; exiting" >&2; exit 1; }
 
@@ -82,6 +117,7 @@ elif (( idx + 1 >= ${#SEQ[@]} )); then
     log "DRY_RUN would stop collector and mark done"
     exit 0
   fi
+  wait_for_radioviz_release
   "${COMPOSE[@]}" stop collector
   echo "done" > "$STATE_FILE"
   log "COMPLETE collector stopped; all $((${#SEQ[@]})) values collected"
@@ -97,6 +133,8 @@ if [[ "$DRY_RUN" == 1 ]]; then
   log "DRY_RUN no changes made"
   exit 0
 fi
+
+wait_for_radioviz_release
 
 # Persist the new value where compose reads it, then recreate the collector.
 # --build picks up any code changes since the last flip (cached no-op when the
