@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "cachetools>=6.2.1",
-    "cosmosdr @ git+https://github.com/Chrisjw42/cosmosdr.git@0.1.0",
+    "cosmosdr @ git+https://github.com/Chrisjw42/cosmosdr.git@0.1.1",
     "pandas>=2.3.2",
     "plotly>=6.3.0",
     "psycopg[binary]>=3.2",
