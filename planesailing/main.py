@@ -67,6 +67,7 @@ import rs1090
 import cosmosdr.signal_acquisition as s_acq
 
 from planesailing.adsb_processing import (
+    confirmed_addresses,
     preprocess_iq,
     convert_to_binary,
     decode_to_adsb,
@@ -396,7 +397,14 @@ class ADSBStreamer:
         if full_df is None or full_df.empty or "icao24" not in full_df.columns:
             return
 
-        df = full_df[full_df["icao24"].isin(icao24_latest.keys())]
+        # Ghost suppression, part 2: an aircraft is written only if a frame with checkable parity (DF17/18 or an
+        # intact DF11) in the cache vouches for its address. Part 1 (below) drops snapshots with neither position nor
+        # altitude, but a ghost made from a corrupted DF20 carries its parent's altitude, so it got past part 1.
+        confirmed = confirmed_addresses(full_df)
+        df = full_df[
+            full_df["icao24"].isin(icao24_latest.keys())
+            & full_df["icao24"].isin(confirmed)
+        ]
         if df.empty:
             return
 
