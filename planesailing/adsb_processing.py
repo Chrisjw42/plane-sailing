@@ -25,12 +25,23 @@ logger = structlog.get_logger()
 ADSB_BITS = 112
 
 
-def trim_iq_around_peak(iq_mag, n_either_side=1000):
-    """Trim the IQ data around the peak. Essentially assuming that there is a peak in the data, which is a single
-    pulse, and we want to center on it.
+# Half-width of the window kept around the strongest pulse, in samples at the 12 MS/s target rate. A reply is
+# 120 us long (8 us preamble + 112 us of bits) and its strongest pulse can be anywhere in it, so each half must hold
+# a whole frame: 1600 samples = 133 us. (It was 1000 = 83 us: a frame then fitted only if its strongest pulse was
+# 37-83 us in. Otherwise the preamble fell outside the window, or the tail did and np.packbits zero-padded it: in
+# October ~35% of stored DF20 frames ended in padded zeros, and nearly all of those were filed under a ghost address.)
+TRIM_HALF_WIDTH = 1600
+
+
+def trim_iq_around_peak(iq_mag, n_either_side=TRIM_HALF_WIDTH):
+    """Keep a window of 2 * n_either_side samples around the strongest pulse, so the whole frame is in it.
+
+    The window is clamped to start inside the read: a peak near the start used to give a negative slice start,
+    an empty window, and a ValueError from threshold_elbow that abandoned the rest of the grab.
     """
-    idx = iq_mag.argmax()
-    return iq_mag[idx - n_either_side : idx + n_either_side]
+    idx = int(iq_mag.argmax())
+    start = max(idx - n_either_side, 0)
+    return iq_mag[start : start + 2 * n_either_side]
 
 
 def shift_to_optimal_phase(iq_mag, samples_per_us, verbose=False):
@@ -207,3 +218,53 @@ def convert_adsb_binary_to_hex(adsb):
     hex_string = packed.tobytes().hex()
 
     return hex_string
+
+
+# ---- Address confirmation (ghost suppression) ----------------------------------------------------------------------
+#
+# DF4/5/20/21 replies carry no checkable parity: the transponder XORs its address into the CRC, and the receiver
+# recovers the address as CRC(data) XOR AP. One corrupted bit therefore yields a different, plausible-looking
+# address, with the real aircraft's altitude. Only frames whose parity can be checked prove an address exists.
+
+MODE_S_GENERATOR = 0x1FFF409  # CRC-24 generator polynomial (25 bits)
+
+
+def mode_s_crc_remainder(hex_frame: str) -> int:
+    """Remainder of the whole frame (data + parity bits) divided by the Mode S generator."""
+    bits = len(hex_frame) * 4
+    v = int(hex_frame, 16)
+    for i in range(bits - 1, 23, -1):
+        if v >> i & 1:
+            v ^= MODE_S_GENERATOR << (i - 24)
+    return v & 0xFFFFFF
+
+
+def df11_parity_ok(hex_frame: str) -> bool:
+    """A 56-bit DF11 all-call reply is intact if its remainder is an interrogator code (II or SI: below 0x80).
+
+    rs1090 decodes DF11 without checking this, so a corrupted DF11 would vouch for a ghost."""
+    if len(hex_frame) != 14 or int(hex_frame[:2], 16) >> 3 != 11:
+        return False
+    return mode_s_crc_remainder(hex_frame) < 0x80
+
+
+def confirmed_addresses(decoded) -> set:
+    """icao24s vouched for by a frame whose parity can be checked: DF17/18 (rs1090 drops those on a bad CRC) or an
+    intact DF11. `decoded` is the DataFrame of rs1090.decode output for the message cache."""
+    if (
+        decoded is None
+        or decoded.empty
+        or "icao24" not in decoded.columns
+        or "df" not in decoded.columns
+    ):
+        return set()
+    df_codes = decoded["df"].astype(str)
+    confirmed = set(decoded.loc[df_codes.isin(["17", "18"]), "icao24"].dropna())
+    if "frame" in decoded.columns:
+        df11 = decoded[df_codes == "11"]
+        confirmed |= {
+            a
+            for a, f in zip(df11["icao24"], df11["frame"])
+            if isinstance(f, str) and df11_parity_ok(f)
+        }
+    return confirmed
