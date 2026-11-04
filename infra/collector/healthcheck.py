@@ -5,8 +5,10 @@ health in ``docker ps`` / ``docker inspect`` so you can see at a glance whether
 the collector is producing data. It does NOT trigger restarts on its own; that
 is handled by run.py exiting non-zero combined with the compose restart policy.
 
-Exit 0 = a row landed within COSMOS_STALENESS_SECONDS; exit 1 = stale, empty, or
-DB unreachable.
+Exit 0 = a row landed within COSMOS_ROW_STALENESS_SECONDS (default 4 h); exit 1 =
+stale, empty, or DB unreachable. Not COSMOS_STALENESS_SECONDS: that is run.py's
+decode-loop heartbeat, which this separate process can't see, and a quiet night
+goes 15-40 minutes without a row while the collector is healthy.
 """
 
 import os
@@ -17,7 +19,7 @@ from planesailing.db import _connect
 
 
 def main() -> None:
-    staleness_s = float(os.environ.get("COSMOS_STALENESS_SECONDS") or 900.0)
+    staleness_s = float(os.environ.get("COSMOS_ROW_STALENESS_SECONDS") or 4 * 3600.0)
 
     try:
         with _connect() as conn:

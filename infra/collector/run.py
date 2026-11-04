@@ -4,13 +4,21 @@ This is *orchestration*, not application logic. It lives under infra/, consumes
 ``planesailing`` as a library, and is responsible only for:
   - turning ``COSMOS_*`` env vars into a :class:`PipelineConfig`,
   - starting the long-running :class:`ADSBStreamer`,
-  - watching that rows keep landing in ``cosmos.readings``, and
+  - watching that the decode loop keeps turning and rows keep landing in
+    ``cosmos.readings``, and
   - exiting non-zero (so Docker's ``restart: unless-stopped`` policy brings us
     back) if collection stalls or the acquisition thread dies.
 
-A "stall" is: no new row in ``cosmos.readings`` for ``COSMOS_STALENESS_SECONDS``.
-This catches the silent-failure mode where the process is alive but the SDR has
-stopped delivering usable data. Health transitions are appended to a text file
+A "stall" is either of:
+  - no completed decode cycle for ``COSMOS_STALENESS_SECONDS`` (``reason=no_cycle``):
+    the process is alive but the SDR has stopped delivering samples, so the loop
+    is stuck waiting for them;
+  - no new row in ``cosmos.readings`` for ``COSMOS_ROW_STALENESS_SECONDS``
+    (default 4 h; ``reason=no_rows``): the loop turns but hears nothing, e.g. a
+    deaf receiver.
+Rows alone are not a heartbeat: since the decoder writes only aircraft that a
+CRC-checked frame vouched for, a quiet night can go 15-40 minutes without a
+single row while everything is working. Health transitions are appended to a text file
 (``COSMOS_HEALTH_LOG_PATH``, bind-mounted to the host) so overnight stalls and
 restarts are visible the next morning, as well as going to stdout for
 ``docker logs``.
@@ -115,8 +123,36 @@ def _last_row_age_seconds() -> tuple[float | None, datetime | None]:
     return age, last_ts
 
 
+class _CycleHeartbeat:
+    """Time of the acquisition thread's last completed decode cycle.
+
+    Wraps ``ADSBStreamer._batch_generate_hexes`` on the instance (the loop calls it
+    through ``self``), so the library needs no change. A float assignment is atomic
+    under the GIL, so the watchdog thread can read it without a lock.
+    """
+
+    def __init__(self) -> None:
+        self.last: float | None = None
+
+    def install(self, streamer) -> None:
+        inner = streamer._batch_generate_hexes
+
+        def stamped(*args, **kwargs):
+            result = inner(*args, **kwargs)
+            self.last = time.monotonic()
+            return result
+
+        streamer._batch_generate_hexes = stamped
+
+    def age(self) -> float | None:
+        return None if self.last is None else time.monotonic() - self.last
+
+
 def main() -> None:
+    # No completed decode cycle for this long = stalled (the name predates the heartbeat; compose sets it).
     staleness_s = _env_float("COSMOS_STALENESS_SECONDS", 900.0)  # 15 minutes
+    # No row for this long, while the loop turns = deaf. Quiet nights go ~40 min without a vouched aircraft.
+    row_staleness_s = _env_float("COSMOS_ROW_STALENESS_SECONDS", 4 * 3600.0)
     interval_s = _env_float("COSMOS_HEALTH_INTERVAL_SECONDS", 60.0)
 
     cfg = build_config()
@@ -124,12 +160,15 @@ def main() -> None:
         "STARTUP",
         fingerprint=cfg.fingerprint(),
         staleness_window_s=int(staleness_s),
+        row_staleness_window_s=int(row_staleness_s),
         check_interval_s=int(interval_s),
     )
     logger.info(
         "collector starting", config=cfg.as_dict(), fingerprint=cfg.fingerprint()
     )
 
+    heartbeat = _CycleHeartbeat()
+    heartbeat.install(ADSBStreamer)
     ADSBStreamer.start_adsb_stream(config=cfg, persist=True, verbose=False)
 
     process_start = time.monotonic()
@@ -151,30 +190,39 @@ def main() -> None:
                 _health_write("DB_ERROR", error=type(e).__name__)
                 continue
 
-            # Grace period after (re)start: give the pipeline time to produce its
-            # first row before we'd ever consider exiting. Equal to the staleness
+            # Grace period after (re)start: give the pipeline time to complete its
+            # first cycle before we'd ever consider exiting. Equal to the staleness
             # window so a restart after a long outage isn't instantly re-killed.
-            in_grace = (time.monotonic() - process_start) < staleness_s
+            uptime = time.monotonic() - process_start
+            in_grace = uptime < staleness_s
+            # Before the first cycle, time since start stands in for the cycle age.
+            cycle_age = heartbeat.age()
+            cycle_age = uptime if cycle_age is None else cycle_age
+            hung = cycle_age > staleness_s and not in_grace
 
             if age is None:
-                if in_grace:
-                    _health_write("STARTING", last_row="none")
-                else:
-                    _health_write("STALE", last_row="none", action="exit")
+                if hung:
+                    _health_write("STALE", reason="no_cycle", last_row="none",
+                                  last_cycle_age_s=int(cycle_age), action="exit")
                     sys.exit(1)
+                _health_write("STARTING", last_row="none", last_cycle_age_s=int(cycle_age))
                 continue
 
             last_ts_str = last_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-            if age > staleness_s and not in_grace:
+            deaf = age > row_staleness_s and uptime >= row_staleness_s
+            if hung or deaf:
                 _health_write(
                     "STALE",
                     last_row_age_s=int(age),
                     last_row_ts=last_ts_str,
+                    reason="no_cycle" if hung else "no_rows",
+                    last_cycle_age_s=int(cycle_age),
                     action="exit",
                 )
                 sys.exit(1)
             else:
-                _health_write("OK", last_row_age_s=int(age), last_row_ts=last_ts_str)
+                _health_write("OK", last_row_age_s=int(age), last_row_ts=last_ts_str,
+                              last_cycle_age_s=int(cycle_age))
     except KeyboardInterrupt:
         _health_write("SHUTDOWN", reason="interrupt")
         ADSBStreamer.stop_stream()
