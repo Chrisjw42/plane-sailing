@@ -14,10 +14,7 @@
                                 v
     +-------------------------------------------------------------+
     | _batch_generate_hexes                    [stage-1, per-peak]|
-    |   top-N peaks -> preprocess_iq                              |
-    |               -> convert_to_binary                          |
-    |               -> decode_to_adsb                             |
-    |               -> convert_adsb_binary_to_hex                 |
+    |   top-N peaks -> soft_demod.demodulate (0..k replies/read)  |
     |   each hit -> RecentMessagesCache (5-min TTL)               |
     |            -> newly_added list (this cycle only)            |
     +-----+-----------------------------------------+-------------+
@@ -73,6 +70,7 @@ from planesailing.adsb_processing import (
     decode_to_adsb,
     convert_adsb_binary_to_hex,
 )
+from planesailing.soft_demod import demodulate
 from planesailing.config import PipelineConfig
 from planesailing.db import DBWriter, PlaneSnapshot
 from planesailing.util import (
@@ -321,18 +319,13 @@ class ADSBStreamer:
                 for i, index in enumerate(indices_of_strongest_signal):
                     iq = signal[index]
 
-                    # Only do the expensive signal processing on the strongest read
-                    iq_mag = preprocess_iq(
-                        iq, orig_sr=sample_rate, target_sr=target_sr, verbose=verbose
-                    )
-                    iq_mag_bin = convert_to_binary(iq_mag)
-                    adsb = decode_to_adsb(iq_mag_bin, verbose=verbose)
-
-                    if adsb is not None:
-                        # We have what looks like an ADSB message, try to decode it
+                    # Every reply in the read that its parity (or, for address/parity replies, a clean decision)
+                    # vouches for; see soft_demod. A read can hold several.
+                    for hex_string in demodulate(
+                        iq, orig_sr=sample_rate, target_sr=target_sr
+                    ):
                         if verbose:
-                            logger.info("ADSB message identified, attempting to decode")
-                        hex_string = convert_adsb_binary_to_hex(adsb)
+                            logger.info("Mode S reply demodulated")
                         hits += 1
                         # multiple timestamped messages are required to decode true position
                         hit = ADSBPreParsedHit(
